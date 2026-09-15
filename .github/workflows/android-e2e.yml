@@ -8,14 +8,6 @@ on:
         required: true
         type: string
         default: main
-      scope:
-        description: Which instrumentation test targets to run
-        required: true
-        type: choice
-        options:
-          - app
-          - all
-        default: app
       api_level:
         description: Emulator Android API level
         required: true
@@ -131,13 +123,53 @@ jobs:
           org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
           GRADLE
 
+      - name: Setup Ruby
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The E2E suite is driven through fastlane: it has to run the instrumentation
+          # in several batches of test classes rather than one invocation, and doing that
+          # with a shell loop inside the emulator action's `script` is not possible —
+          # script-parser.ts splits the value on newlines and runs each line as its own
+          # `sh -c`, so no variable survives across lines and any `if`/`for` block fails
+          # to parse. A lane keeps the loop in Ruby, where it belongs.
+          if ! command -v ruby >/dev/null 2>&1; then
+            echo "::error::Ruby is missing; the E2E lane cannot run"
+            exit 1
+          fi
+          if ! command -v make >/dev/null 2>&1; then
+            echo "::error::make is missing and this runner cannot install build tools"
+            exit 1
+          fi
+          ruby --version
+          ruby -e 'abort("Ruby 3.1 or newer is required") if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")'
+          echo "GEM_HOME=$RUNNER_TEMP/gems" >> "$GITHUB_ENV"
+          echo "GEM_PATH=$RUNNER_TEMP/gems" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/gems/bin" >> "$GITHUB_PATH"
+          export GEM_HOME="$RUNNER_TEMP/gems"
+          export GEM_PATH="$GEM_HOME"
+          export PATH="$GEM_HOME/bin:$PATH"
+          BUNDLER_VERSION=$(awk '/^BUNDLED WITH$/{getline; gsub(/^ +/, ""); print}' Gemfile.lock)
+          gem install bundler --version "$BUNDLER_VERSION" --no-document
+          bundle config set --local path "$RUNNER_TEMP/bundle"
+          bundle install --jobs 4 --retry 3
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-home-cache-cleanup: true
 
+      # `packages` is set explicitly to drop `tools` from the action's default of
+      # "tools platform-tools". Google removed the `tools` package from the SDK, and a
+      # current `sdkmanager` exits 1 on it ("Failed to find package 'tools'") rather than
+      # warning, which fails this step and skips everything after it. `platform-tools` is
+      # also installed by the step below, listed here only so the action has something to
+      # do; the build's real packages come from there.
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install Android SDK packages
         run: |
@@ -166,7 +198,12 @@ jobs:
           # 3 GB rather than 4: the emulator and the Gradle build have to fit
           # in 16 GB together, and the build's own peak is what pushes it over.
           ram-size: 3072M
-          heap-size: 512M
+          # No heap-size: the action writes it to `vm.heapSize` in the AVD's
+          # config.ini, which the emulator ignores. An AVD set here to 512M
+          # reports dalvik.vm.heapsize=576m and heapgrowthlimit=192m — neither
+          # is the value passed — so the setting only ever looked like it took
+          # effect. The 192 MB growth limit comes from the system image and is
+          # what the E2E batches are sized against.
           disable-animations: true
           # A boot failure leaves adb polling against a dead emulator, so cap
           # the wait well below the job timeout and let the step fail fast.
@@ -177,20 +214,75 @@ jobs:
           # not survive across lines, multi-line `if`/`fi` blocks fail to
           # parse, and `#` comment lines are dropped. `sh` is dash on Ubuntu,
           # so `set -o pipefail` is illegal here too.
+          #
+          # The :app suite is driven by the `e2e` lane rather than by a shell loop here.
+          #
+          # Instrumentation reuses one process for a whole invocation and the app retains
+          # memory per case, so all ~394 cases in one invocation exhausts the 192 MB cap
+          # and the run dies partway through — the last one reported `Finished 139 tests`,
+          # leaving 255 cases unrun. Splitting into batches of test classes gives each
+          # batch its own process, so the retained set starts over.
+          #
+          # The loop cannot live here: script-parser.ts splits this value on newlines and
+          # runs each line as its own `sh -c`, so no variable survives across lines and
+          # any `if`/`for` block fails to parse. The lane holds the loop in Ruby.
+          #
+          # The batching is done with an explicit per-invocation class list, not with
+          # AGP's numShards/shardIndex: those are dropped before they reach
+          # AndroidJUnitRunner, so every shard ran the entire suite instead of its slice.
+          # That is why a sharded run still died at the same case as an unsharded one.
           script: >-
             chmod +x ./gradlew &&
-            TASKS=":app:connectedGithubDebugAndroidTest" &&
-            if [ "${{ inputs.scope }}" = "all" ]; then
-            TASKS="$TASKS
-            :feature:schedule:connectedDebugAndroidTest
-            :feature:my:connectedDebugAndroidTest
-            :feature:sport:connectedDebugAndroidTest
-            :feature:score:connectedDebugAndroidTest
-            :feature:print:connectedDebugAndroidTest
-            :feature:coursescore:connectedDebugAndroidTest";
-            fi &&
-            echo "Running: $TASKS" &&
-            ./gradlew --no-daemon -Pandroid.builder.sdkDownload=false $TASKS
+            bundle exec fastlane android e2e
+
+      # A batch that OOMs is reported by Gradle as "Process crashed", which fails
+      # this job already. What that report does *not* say is how many cases never
+      # ran, so an aborted run looks like a run with one failure. Summing the
+      # per-batch XMLs is what turns "batch 7 crashed" into "N of M cases ran".
+      - name: Summarise E2E batch results
+        if: always()
+        working-directory: android
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET, sys
+
+          # Per-batch XMLs are the source of truth. The lane moves each batch's
+          # results out of the live results directory as soon as it finishes,
+          # because the next invocation overwrites that path.
+          files = sorted(glob.glob("build/e2e-batches/batch-*/*/**/*.xml", recursive=True))
+          if not files:
+              files = sorted(glob.glob("app/build/outputs/androidTest-results/**/*.xml", recursive=True))
+              print("::warning::No per-batch results found; falling back to the live results directory")
+
+          total = failures = errors = 0
+          batches = {}
+          for path in files:
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError:
+                  continue
+              if root.tag not in ("testsuite", "testsuites"):
+                  continue
+              for suite in ([root] if root.tag == "testsuite" else root.iter("testsuite")):
+                  total += int(suite.get("tests", 0) or 0)
+                  failures += int(suite.get("failures", 0) or 0)
+                  errors += int(suite.get("errors", 0) or 0)
+              batch = path.split("e2e-batches/")[1].split("/")[0] if "e2e-batches/" in path else "final"
+              batches[batch] = batches.get(batch, 0) + int(root.get("tests", 0) or 0)
+
+          print(f"E2E cases executed: {total}, failures: {failures}, errors: {errors}")
+          for batch in sorted(batches, key=lambda s: (s == "final", s)):
+              print(f"  {batch}: {batches[batch]} cases")
+          if total == 0:
+              print("::error::No E2E results were collected at all")
+              sys.exit(1)
+          short = [s for s, n in batches.items() if s != "final" and n == 0]
+          if short:
+              print(f"::error::These batches reported zero cases: {', '.join(sorted(short))}")
+              sys.exit(1)
+          print(f"::warning::Expected ~394 :app cases; if this total is far below it, a batch aborted early")
+          PY
 
       - name: Upload test reports
         if: always()
@@ -200,6 +292,7 @@ jobs:
           path: |
             android/**/build/reports/androidTests/**
             android/**/build/outputs/androidTest-results/**
+            android/**/build/e2e-batches/**
           retention-days: 7
           if-no-files-found: warn
 
